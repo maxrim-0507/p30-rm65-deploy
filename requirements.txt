@@ -1,0 +1,28 @@
+# === 核心运行时 ===
+numpy
+torch
+torchvision
+
+# === VLA（GR00T / LeRobot）===
+# 注意：GR00T 需要 lerobot 的 groot 分支/特定版本（本地 /home/user/mujoco_lerobot）。
+# 按你的 lerobot 源码安装：  pip install -e /path/to/mujoco_lerobot
+lerobot
+transformers
+huggingface_hub
+safetensors
+
+# === 通信 / 服务（L3/l2 总线）===
+pyzmq
+msgpack
+
+# === 视觉 / 感知 ===
+opencv-python
+pillow
+pyyaml
+scipy
+
+# === IK（RM65 可达性）===
+# ikpy 或官方 rm_algo_ik（随 real_backend / skills 使用）
+
+# === 仿真后端（仅回归用；真机可不装）===
+# mujoco

@@ -1,0 +1,24 @@
+__pycache__/
+*.pyc
+*.pyo
+
+# 模型权重 / 大数据（不入库）
+checkpoints/
+*.safetensors
+*.pt
+*.pth
+data/
+outputs/
+weights/
+*.mp4
+*.npz
+*.npy
+*.pkl
+
+# 临时 / 日志 / 备份
+.tmpm/
+*.log
+*.bak*
+.DS_Store
+.vscode/
+.idea/
