@@ -1,0 +1,66 @@
+# 真机相机标定（唯一真源，S5 现场填写）
+#
+# === 这个文件解决什么 ===
+# 仿真里相机内外参由 MuJoCo 每帧给出；真机没有模型，只能靠标定。
+# RealBackend.camera_info() 读本文件 + 当前底盘位姿/关节角，30 Hz 算
+# 出每台相机的世界位姿，随 L3 状态帧广播给 L2（LocalBackend.camera_model）。
+# 反投影（像素 → 台面平面）全靠它，填错不报错、只会定位偏。
+#
+# === 填写顺序（现场） ===
+# 1. 内参：用棋盘格/ROS camera_calibration 标定，填 fx/fy/cx/cy（像素）
+#    与 width/height（图像实际尺寸）。不要拿仿真的 fovy 套真机。
+# 2. 台面高度：在 mount.yaml 的 table.top_z 填实测值（不是这里）。
+#    z 差 1 cm ≈ 平面反投影差 1 cm，两者一起决定抓取高度。
+# 3. 外参 mount：相机相对 parent 的刚体位姿（米 / 3x3 旋转），
+#    旋转的**列**是相机轴在 parent 系下的方向（right, up, -forward）。
+# 4. 全部填完把 calibrated 改成 true。false 或有 null 时
+#    camera_info() 返回 {}，上层会显式报「无视觉」，不会拿垃圾位姿硬算。
+#
+# === 下面这些 mount 是从仿真场景反解出来的标称值 ===
+# 可作为「CAD 标称」起点，但真机装配公差、相机型号都可能不同，
+# S5 必须实测复核。front_cam 的参数是本项目硬约束，不要凭这个文件去改场景。
+
+# 站立时 base_link（躯干几何中心）原点的世界高度，米。实测填写。
+base_link_z: 0.600
+
+# base_link → arm_base_link（RM65 底座原点）。来自 mount.yaml 的安装参数。
+arm_mount:
+  pos: [0.060, 0.000, 0.110]      # mount.yaml: x=0.06, y=0, z=0.710-0.600
+  rot: [[-1.0, 0.0, 0.0],
+        [0.0, -1.0, 0.0],
+        [0.0, 0.0, 1.0]]          # yaw 180°
+
+cameras:
+  front_cam:
+    # 狗前脸内凹面板；仿真 fovy 70、320×240（真机分辨率另填）
+    width: 640
+    height: 480
+    fx: null
+    fy: null
+    cx: null
+    cy: null
+    parent: base_link
+    pos: [0.390, 0.000, 0.0481]
+    rot: [[0.000000, 0.707107, -0.707107],
+          [-1.000000, 0.000000, -0.000000],
+          [0.000000, 0.707107, 0.707107]]
+    # 图像来源必须现场定（RealSense / RTSP / OAK-D），仅作记录
+    source: "现场定：RealSense 或机身 RTSP"
+    calibrated: false
+
+  arm_cam:
+    # 装在 Dex1-1 夹爪顶部凸台；眼在手，抓取精度靠它
+    width: 640
+    height: 480
+    fx: null
+    fy: null
+    cx: null
+    cy: null
+    parent: grasp_site             # 与 eef_9d 同源：夹持面中心
+    # 标称值是在 FWD2 姿态下从仿真反解的；先验值，真机必须复核
+    pos: [0.000000, -0.053800, 0.064800]
+    rot: [[1.000000, 0.000000, 0.000000],
+          [0.000000, 0.642817, -0.766020],
+          [0.000000, 0.766020, 0.642817]]
+    source: "现场定：RealSense 或机身 RTSP"
+    calibrated: false

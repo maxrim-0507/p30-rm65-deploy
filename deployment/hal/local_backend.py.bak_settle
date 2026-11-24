@@ -1,0 +1,310 @@
+# -*- coding: utf-8 -*-
+"""同进程代理：把 ControlServer 包成 RobotBackend 给 L2 用。
+
+=== 为什么必须存在 ===
+inline 调试时如果让 L2 直接用 MujocoBackend，L2 与 L3 线程会同时
+actuate 同一个 MjData：
+  - L2 写 ctrl = 目标；
+  - L3 主循环下一拍读 q_meas（还没动），看门狗又把 ctrl 写回 q_meas。
+结果机械臂纹丝不动，而所有 IK 都是对的 —— 表现为「工具轴偏 23.6°」
+这种看起来像 IK 错误的现象，实际是并发覆盖。实测踩过。
+
+用这个代理后，inline 与跨进程（RemoteBackend）**语义完全一致**：
+读的是最新快照，写的是请求队列，只有 L3 主循环碰硬件。
+
+=== 与 RemoteBackend 的区别 ===
+只有「传输」不同：一个走对象引用，一个走 ZMQ。两者都实现
+RobotBackend，所以技能代码不用知道自己跑在哪种模式。
+"""
+import threading
+import time
+
+import os
+
+import numpy as np
+
+from .base import RobotBackend
+
+
+class LocalBackend(RobotBackend):
+
+    def __init__(self, server, hb_period_s=0.05):
+        self.srv = server
+        self._t0 = time.monotonic()
+        self._hb_period = float(hb_period_s)
+        self._hb_stop = threading.Event()
+        self._hb_thread = None
+
+    def connect(self):
+        # 等服务端至少广播过一帧
+        t0 = time.monotonic()
+        while time.monotonic() - t0 < 5.0:
+            st, _ = self.srv.snapshot()
+            if st is not None:
+                break
+            time.sleep(0.02)
+        else:
+            raise TimeoutError("L3 尚未广播任何状态")
+
+        # === 心跳必须持续发，否则看门狗会一直 hold ===
+        # 实测踩过：L3 的 watchdog_ms=200，L2 只在 connect 时刷过一次心跳，
+        # 200 ms 后 L3 永远走 hold 分支 → 机械臂纹丝不动，而所有 IK 都
+        # 是正确的，现象是「工具轴偏 17.7°」，极易误判成 IK/重力问题。
+        self._hb_stop.clear()
+        self._hb_thread = threading.Thread(target=self._hb_loop, daemon=True)
+        self._hb_thread.start()
+        return self
+
+    def _hb_loop(self):
+        while not self._hb_stop.is_set():
+            try:
+                self.srv.safety.note_heartbeat()
+            except Exception:
+                pass
+            self._hb_stop.wait(self._hb_period)
+
+    def close(self):
+        self._hb_stop.set()
+        if self._hb_thread is not None:
+            self._hb_thread.join(timeout=0.5)
+            self._hb_thread = None
+
+    # ---------- 执行（只入队）----------
+    def actuate(self, joint, gripper):
+        q = np.asarray(joint, dtype=float).reshape(6)
+        with self.srv._lock:
+            self.srv._target = (q, float(gripper), time.monotonic())
+            self.srv._pose_target = None      # 最后一条指令生效
+        return {"ok": True, "err": None}
+
+    @property
+    def supports_pose_command(self):
+        return bool(getattr(self.srv.backend, "supports_pose_command", False))
+
+    def actuate_pose(self, pos, rot6d, gripper):
+        """只入队；IK 与安全闸都在 L3 里，和跨进程语义一致。"""
+        if not self.supports_pose_command:
+            return {"ok": False,
+                    "err": "后端 %s 不支持位姿指令" % self.srv.backend.name}
+        p = np.asarray(pos, dtype=float).reshape(3)
+        r6 = np.asarray(rot6d, dtype=float).reshape(6)
+        with self.srv._lock:
+            self.srv._pose_target = (p, r6, float(gripper), time.monotonic())
+            self.srv._target = None
+        return {"ok": True, "err": None}
+
+    def step(self, n=1):
+        # 手动步进模式下不要 sleep：真正推进由 apply_step 做
+        if getattr(self.srv, "_manual", False):
+            return
+        # 物理推进由 L3 主循环负责，这里只给调用方一个节奏点
+        time.sleep(0.001 * int(n))
+
+    # ---------- 精确同步（inline 专用）----------
+    def enter_sync(self):
+        """让 L3 主循环完全让出物理，由本代理精确步进。
+
+        目的：使 inline 部署与 rollout 等价 —— rollout 每动作精确推进
+        16 个物理步（0.002 s × 16 = 32 ms）且推理期间物理静止；默认的
+        异步 L3 循环每动作会跑 ~25 步（step 睡 17 ms + 循环 sleep 33 ms），
+        在混沌系统里累积成 4~10 cm 的横向偏差（实测）。
+        """
+        # === 必须握手，不能只 sleep ===
+        # 仅置位标志时主循环可能正身处一次 mj_step 中间，随后 L2 又
+        # apply_step 一次 -> 首个动作多推进一拍。这里等 L3 完整走完一次
+        # 让出分支（_manual_seen 前进）再返回，确保没有在途步进。
+        seen = self.srv._manual_seen
+        self.srv._manual = True
+        t0 = time.monotonic()
+        while time.monotonic() - t0 < 2.0:
+            if self.srv._manual_seen > seen:
+                return
+            time.sleep(0.001)
+        raise TimeoutError("L3 未进入手动步进模式")
+
+    def exit_sync(self):
+        """恢复 L3 自主步进；清空目标，避免恢复后追旧指令。"""
+        with self.srv._lock:
+            self.srv._pose_target = None
+            self.srv._target = None
+            self.srv._base_target = None
+        self.srv.safety._p_prev = None
+        self.srv.safety._q_prev = None
+        self.srv.safety.reset_base_vel()
+        self.srv._manual = False
+
+    def apply_step(self, n=None):
+        """应用当前目标并推进 n 个物理步（默认按 30 Hz 折算 16 步）。
+
+        与 ControlServer.run() 的正常分支同一套语义：filter_pose →
+        actuate_pose；底盘 filter_base_vel → move_base。
+
+        整段持 _phys_lock：手动模式下 L3 属主线程只在同一把锁里做渲染/
+        广播，两边不会同时碰 MjData。
+
+        === 速率整形必须旁路（只在这里）===
+        位姿单步上限 / 底盘加速度上限是**按墙钟 dt 折算**的约束，用来吃
+        异步循环抖动。rollout 的 step_pose 没有任何速率整形，而训练数据
+        本身单步位移最大 26.6 mm、底盘速度单帧可跳 ~0.1 m/s。留着这两
+        层会截掉 ~9% 的分布内动作（实测：臂错过目标、抓到邻块）。
+        这里与 rollout 同语义：工作空间盒 + NaN 闸照旧，底盘只做执行器
+        ctrlrange 夹紧（由 backend.move_base 完成）。
+        """
+        srv = self.srv
+        b = srv.backend
+        if n is None:
+            n = 16      # rollout 的 step_pose 精确步数
+        with srv._phys_lock:
+            st = b.get_state()
+            with srv._lock:
+                ptgt = srv._pose_target
+                tgt = srv._target
+                btg = srv._base_target
+            g_cmd = st["gripper"]
+            if ptgt is not None:
+                p_req, r6, g_cmd, _t = ptgt
+                p_safe, info = srv.safety.filter_pose(p_req,
+                                                     check_step=False)
+                if info["ok"]:
+                    b.actuate_pose(p_safe, r6, g_cmd)
+                else:
+                    b.actuate(st["joint"], g_cmd)
+            elif tgt is not None:
+                q_req, g_cmd, _t = tgt
+                b.actuate(q_req, g_cmd)
+            if btg is not None and getattr(b, "supports_base", False):
+                cmd = btg[0]
+                b.move_base(float(cmd[0]), float(cmd[1]), float(cmd[2]))
+            _DBG = os.environ.get("GR00T_BASEDBG")
+            if _DBG:
+                _sx = b.m.joint("base_slide_x").qposadr[0]
+                _sy = b.m.joint("base_slide_y").qposadr[0]
+                _x0 = float(b.d.qpos[_sx]); _y0 = float(b.d.qpos[_sy])
+            b.step(int(n))
+            if _DBG:
+                _dx = float(b.d.qpos[_sx]) - _x0
+                _dy = float(b.d.qpos[_sy]) - _y0
+                _cm = (None if btg is None
+                       else [round(float(v), 3) for v in btg[0][:3]])
+                print("[bdbg] cmd=%s dpos=(%.5f,%.5f) n=%d dt=%.5f"
+                      % (_cm, _dx, _dy, int(n),
+                         float(b.m.opt.timestep)), flush=True)
+        return {"ok": True}
+
+    # ---------- 手动模式下的新鲜观测 ----------
+    # 异步模式读快照是刻意的（L3 可能正在 mj_step）；手动模式下物理只在
+    # apply_step 里推进，持 _phys_lock 直读后端既安全，又能拿到「本动作
+    # 执行完之后」的精确状态 —— 与 rollout 的 observe() 等价。
+    def _manual_mode(self):
+        return bool(getattr(self.srv, "_manual", False))
+
+    def fresh_images(self):
+        """请 L3 属主线程渲染一帧并等它完成（renderer 有线程亲和性）。"""
+        srv = self.srv
+        if not self._manual_mode():
+            return self.get_images()
+        seq = srv._render_seq
+        srv._render_req = True
+        t0 = time.monotonic()
+        while time.monotonic() - t0 < 5.0:
+            if srv._render_seq > seq:
+                break
+            time.sleep(0.001)
+        else:
+            raise TimeoutError("渲染请求超时")
+        _, imgs = srv.snapshot()
+        _dd = os.environ.get("GR00T_DUMP_CHUNK")
+        if _dd and not getattr(self, "_q_dumped", False):
+            self._q_dumped = True
+            _b = srv.backend
+            np.save("%s/dep_qpos.npy" % _dd, _b.d.qpos.copy())
+            np.save("%s/dep_qvel.npy" % _dd, _b.d.qvel.copy())
+            np.save("%s/dep_rgba.npy" % _dd, _b.m.geom_rgba.copy())
+            print("[qd] dep qpos=%s" % np.round(
+                _b.d.qpos[:8], 6).tolist(), flush=True)
+        return {k: np.asarray(v) for k, v in imgs.items()}
+
+    # ---------- 底盘 ----------
+    @property
+    def supports_base(self):
+        return bool(getattr(self.srv.backend, "supports_base", False))
+
+    def move_base(self, vx=0.0, vy=0.0, wz=0.0):
+        # 与 actuate 同一套规则：只入队，由 L3 主循环下发
+        if not self.supports_base:
+            return {"ok": False, "err": "backend 不支持底盘控制"}
+        cmd = np.asarray([vx, vy, wz], dtype=float)
+        if not np.all(np.isfinite(cmd)):
+            return {"ok": False, "err": "base 指令含 NaN/inf"}
+        with self.srv._lock:
+            self.srv._base_target = (cmd, time.monotonic())
+        return {"ok": True, "err": None}
+
+    def stop_base(self):
+        if not self.supports_base:
+            return {"ok": True, "err": None}
+        with self.srv._lock:
+            self.srv._base_target = None
+        return {"ok": True, "err": None}
+
+    def get_base_state(self):
+        if self._manual_mode():
+            with self.srv._phys_lock:
+                return self.srv.backend.get_base_state()
+        st, _ = self.srv.snapshot()
+        if st is None or "base" not in st:
+            return {"pos": None, "yaw": None, "vel": (0.0, 0.0, 0.0)}
+        b = st["base"]
+        return {"pos": (None if b.get("pos") is None
+                        else tuple(float(v) for v in b["pos"])),
+                "yaw": b.get("yaw"),
+                "vel": tuple(float(v) for v in
+                             b.get("vel", (0.0, 0.0, 0.0)))}
+
+    # ---------- 观测（读快照）----------
+    def get_state(self):
+        if self._manual_mode():
+            with self.srv._phys_lock:
+                st = self.srv.backend.get_state()
+        else:
+            st, _ = self.srv.snapshot()
+            if st is None:
+                raise RuntimeError("尚无状态快照")
+        return {
+            "joint": np.asarray(st["joint"], np.float64),
+            "joint_cmd": np.asarray(st.get("joint_cmd", st["joint"]),
+                                    np.float64),
+            "gripper": float(st["gripper"]),
+            "gripper_cmd": float(st.get("gripper_cmd", st["gripper"])),
+            "eef_pos": np.asarray(st.get("eef_pos", np.zeros(3)), np.float64),
+            "eef_rot": np.asarray(st.get("eef_rot", np.eye(3)), np.float64),
+            "t": float(st.get("t", 0.0)),
+        }
+
+    def get_images(self):
+        _, imgs = self.srv.snapshot()
+        return {k: np.asarray(v) for k, v in imgs.items()}
+
+    def get_objects(self):
+        if self._manual_mode():
+            with self.srv._phys_lock:
+                return list(self.srv.backend.get_objects())
+        st, _ = self.srv.snapshot()
+        if st is None or "objects" not in st:
+            return []
+        return list(st["objects"])
+
+    def camera_model(self, name):
+        """用 L3 广播的相机内外参构造 CameraModel（真机同样适用）。"""
+        from ..perception.color_grounding import CameraModel
+        st, _ = self.srv.snapshot()
+        if st is None or "cameras" not in st or name not in st["cameras"]:
+            return None
+        c = st["cameras"][name]
+        # 真机标定会带 fx/fy/cx/cy（像素可能非正方、主点可能偏心）；
+        # 仿真只有 fovy，缺省保持原行为。见 perception/real_cameras.py。
+        return CameraModel(int(c["w"]), int(c["h"]), c.get("fovy"),
+                           pos=np.asarray(c["pos"], float),
+                           rot=np.asarray(c["rot"], float).reshape(3, 3),
+                           fx=c.get("fx"), fy=c.get("fy"),
+                           cx=c.get("cx"), cy=c.get("cy"))

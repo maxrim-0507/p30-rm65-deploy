@@ -1,0 +1,121 @@
+# 部署配置（唯一真源）
+#
+# 与 mount.yaml（物理安装）/ vla_spec.yaml（模型接口）分工：
+#   deploy.yaml 只管「进程怎么跑、端口在哪、后端用哪个」，
+#   不写任何物理量。
+#
+# === 为什么 L3 单独一个进程 ===
+# L3 要 100–500 Hz 稳定跑，还要在真机上直接对 RM65 SDK / LatentOS 做阻塞
+# 调用。放进 L2 的 30 Hz 循环里会被 VLA 推理（推理一次 100–200 ms）卡住。
+# 拆进程 + ZMQ 后，L3 的看门狗可以独立于上层卡死而继续输出保持指令。
+
+transport:
+  host: "127.0.0.1"        # 真机跨机时改成 Thor 的网口 IP（见 docs 网络拓扑）
+  # L3 控制服务（REQ/REP）：下发关节目标 + 夹爪
+  cmd_port: 5561
+  # L3 状态广播（PUB）：关节实测 / eef / 夹爪 / 时间戳
+  state_port: 5562
+  # L3 图像广播（PUB）：head + wrist RGB，图像单独一路避免大帧阻塞小帧
+  image_port: 5563
+  # 心跳：L2 每 100 ms 发一次，L3 超过 200 ms 收不到就保持
+  hb_port: 5564
+
+control:
+  rate_hz: 100             # L3 指令插值频率
+  state_rate_hz: 30        # 状态广播频率
+  image_rate_hz: 30        # 图像广播频率
+  watchdog_ms: 200         # 心跳超时 → 保持当前位置
+  max_joint_speed_deg_s: 90.0
+  max_joint_acc_deg_s2: 360.0
+  # 位姿链路的单步位移上限（米/秒）。VLA 出 30 Hz 动作块，
+  # 0.25 m/s → 每步 8.3 mm；模型出一块跳变时在这一层截断。
+  max_eef_speed_m_s: 0.25
+  # 底盘速度上限 [vx, vy, wz]，机体系（m/s, m/s, rad/s）。
+  # 必须 <= p30_rm65_nav.xml 的执行器 ctrlrange（0.6 / 0.4 / 0.8），
+  # 否则这一层形同虚设 —— MuJoCo 会再夹一次，真机则由底层驱动器报错。
+  # VLA 直接输出 base_velocity，模型跳变时靠这层截断。
+  max_base_speed: [0.6, 0.4, 0.8]
+  # 底盘加速度上限 [ax, ay, awz]，单位 m/s²、rad/s²。
+  # 作用是让速度不会从 0 一步跳到上限（狗会甩臂/翻车）。
+  max_base_acc: [1.0, 1.0, 2.0]
+  # 工作空间盒（**臂基座系，xyz 三个分量都相对臂座**，米）。越界直接拒绝。
+  # 2026-11-09：z 从世界高度改为相对臂座（-0.71），与 eef_9d / get_state
+  # 的 eef_pos 同口径。抓取位姿 z = -0.118（世界 0.592），落在本盒内；
+  # 旧配置写的 [0.45, 1.10] 是世界高度，会让所有抓取目标被误判越界。
+  # 依据 make_reach_mask.py 实测可达区外扩 5cm，不要放宽到能碰到台面以下
+  # （台面 z 相对 = -0.160，本盒下限 -0.26 已留出 10cm 余量）。
+  workspace:
+    x: [0.00, 0.75]
+    y: [-0.45, 0.45]
+    z: [-0.26, 0.60]
+
+backend:
+  # mujoco | real
+  # mujoco: 进程内跑 p30_rm65_scene.xml，物理真值，无硬件依赖
+  # real:   RM65 SDK + LatentOS SDK，真机
+  kind: mujoco
+  scene: "p30_rm65_scene.xml"
+
+  mujoco:
+    render: true           # false 时用假图（只测总线，不需要 GPU）
+    realtime: true         # true 时按墙钟节奏推进（30 Hz 观测才有意义）
+
+  real:
+    # RM65（REALMAN）以太网直连，独立网口
+    rm_ip: "192.168.1.18"
+    rm_port: 8080
+    # 6 自由度。单位别混（2026-11-06 按 SDK 源码核实）：
+    #   关节 rm_movej        → 度
+    #   位姿 rm_movej_p/movel → 位置米、姿态**弧度**（不是度）
+    # 把度当弧度发出去是 57 倍姿态误差，且控制器只报参数错误或干脆照做。
+    rm_dof: 6
+    # 夹爪走 RM65 末端 IO（Dex1-1 二指）
+    gripper: "rm65_io"
+    # 狗底盘（LatentOS SDK，Python 只覆盖 motion + battery）
+    dog_sdk_path: "/data/latentos/sdk_python"
+    # 是否允许移动底盘（Phase 1 静态抓取必须 false）
+    allow_base_motion: false
+
+policy:
+  # gr00t:  唯一 VLA 路线（2026-11-09 定稿，τ0 下线）。
+  #         客户端 deployment/policy/gr00t_client.py，base ckpt
+  #         nvidia/GR00T-N1.7-3B；动作 13D，与 vla_spec.yaml 同口径。
+  # oracle: 调试基线 —— 纯解析 IK，不是学习模型，只用于链路自检/DAgger
+  kind: gr00t
+  gr00t:
+    host: "127.0.0.1"
+    port: 5555
+    # ckpt 的 action_horizon=40（base N1.7 与 configs/gr00t/rm65_config.py 一致）。
+    # chunk_size 设小不会报错（客户端截断），但会白扔模型算出来的余量。
+    chunk_size: 40
+    # 30 Hz → 15 步 = 500 ms 执行窗口，与 τ0 的跑通值一致；
+    # 官方 RTC 建议执行 ≥32 步更平滑，等 G4 测出真实推理延迟再调。
+    execute_steps: 40
+    timeout_ms: 15000
+
+# L1 目标定位（技术方案 §3 的 VLM 层）
+grounding:
+  # auto: truth(仿真真值) → vlm → hsv
+  # vlm : Qwen2.5-VL 出 bbox → 台面反投影（主路径）
+  # hsv : 色相阈值（对照基线，不是默认）
+  prefer: "auto"
+  camera: "front_cam"
+  vlm:
+    model_path: "/home/user/rm_test/checkpoints/Qwen2.5-VL-3B-Instruct"
+    device: "cuda"
+    dtype: "bfloat16"
+    max_new_tokens: 128
+
+skills:
+  pregrasp:
+    pre_height: 0.20       # 预抓点比抓取点高多少（米）
+    hover_height: 0.10
+    lift_height: 0.12
+  manipulate:
+    timeout_s: 240.0
+  verify:
+    settle_s: 1.0
+
+task:
+  default_instruction: "抓取红色的方块"
+  replan_max_attempts: 2

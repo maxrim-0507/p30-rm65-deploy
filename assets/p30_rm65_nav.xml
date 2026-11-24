@@ -1,0 +1,559 @@
+<mujoco model="p30_rm65_nav">
+  <!-- 自动派生，勿手改。生成器：make_nav_scene.py （源：p30_rm65_scene.xml） -->
+  <!-- 自动生成，勿手改。生成器：build_scene.py -->
+  <!-- eulerseq 必须是 zyx：机械臂各 body 的 euler 值是从旧 rm65_grasp.xml
+       原样搬过来的，那套值按 zyx 解读才对应 RM65 的真实构型。
+       漏掉这句时 MuJoCo 默认按 xyz 解读，每个连杆初始旋转全错，
+       视觉上表现为「关节扭曲、连杆错位」。
+       实测（diag_sdk_fk.py）：zyx 下正解与 REALMAN SDK 误差 0.0000 m，
+       默认 xyz 累计误差 5.49 m。 -->
+  <compiler angle="radian" eulerseq="zyx" autolimits="true" meshdir="meshes"/>
+  <option gravity="0 0 -9.81" timestep="0.002" integrator="implicitfast" cone="elliptic"/>
+
+  <visual>
+    <!-- 过曝会毁掉颜色条件：ambient 与 diffuse 之和要留余量，
+         否则白台面反射后整体亮度接近 1，彩色方块被冲白、饱和度掉到 0.07。 -->
+    <headlight ambient="0.18 0.18 0.20" diffuse="0.42 0.42 0.44" specular="0.05 0.05 0.05"/>
+    <global offwidth="1280" offheight="960"/>
+    <quality shadowsize="4096"/>
+  </visual>
+
+  <default>
+    <joint armature="0.05" damping="0.5"/>
+    <geom contype="1" conaffinity="1" friction="0.9 0.02 0.001"/>
+    <default class="visual">
+      <geom contype="0" conaffinity="0" group="2"/>
+    </default>
+    <!-- 碰撞代理放 group 3：viewer 默认只开 0/1/2，这样看到的是真实 mesh。
+         之前代理留在 group 0，胶囊比真实连杆粗（RM65 半径 4.5~5cm），
+         把 mesh 整个包住，屏幕上只剩一堆管子。 -->
+    <default class="arm">
+      <geom contype="2" conaffinity="1" group="3"/>
+    </default>
+    <default class="cube">
+      <geom type="box" size="0.03 0.03 0.03" friction="1.5 0.05 0.001"
+            condim="4" contype="1" conaffinity="1"/>
+    </default>
+  </default>
+
+  <asset>
+    <texture type="skybox" builtin="gradient" rgb1="0.55 0.65 0.78" rgb2="0.28 0.32 0.38"
+             width="512" height="3072"/>
+    <texture type="2d" name="floor_tex" builtin="checker" mark="edge"
+             rgb1="0.72 0.72 0.74" rgb2="0.62 0.62 0.65"
+             markrgb="0.55 0.55 0.58" width="512" height="512"/>
+    <material name="floor_mat" texture="floor_tex" texuniform="true" texrepeat="8 8" reflectance="0.08"/>
+    <texture type="2d" name="table_tex" builtin="checker" mark="edge"
+             rgb1="0.80 0.78 0.74" rgb2="0.74 0.72 0.68"
+             markrgb="0.70 0.68 0.64" width="256" height="256"/>
+    <material name="table_mat" texture="table_tex" texuniform="true" texrepeat="3 3" reflectance="0.15"/>
+
+    <!-- P30W 官方简化 mesh（左右镜像用 asset 级 scale，MuJoCo 3.x 不支持 geom scale）-->
+    <mesh name="trunk_vis" file="TRUNK.STL"/>
+    <mesh name="hip_L"    file="FL_HIP.STL"/>
+    <mesh name="hip_R"    file="FL_HIP.STL" scale="1 -1 1"/>
+    <mesh name="thigh_L"  file="FL_THIGH.STL"/>
+    <mesh name="thigh_R"  file="FL_THIGH.STL" scale="1 -1 1"/>
+    <mesh name="calf_L"   file="FL_CALF.STL"/>
+    <mesh name="calf_R"   file="FL_CALF.STL" scale="1 -1 1"/>
+    <mesh name="wheel_L"  file="FL_WHEEL.STL"/>
+    <mesh name="wheel_R"  file="FL_WHEEL.STL" scale="1 -1 1"/>
+
+    <!-- RM65 -->
+    <mesh name="rm65_base" file="rm65/base_link.STL"/>
+    <mesh name="rm65_l1" file="rm65/link1.STL"/>
+    <mesh name="rm65_l2" file="rm65/link2.STL"/>
+    <mesh name="rm65_l3" file="rm65/link3.STL"/>
+    <mesh name="rm65_l4" file="rm65/link4.STL"/>
+    <mesh name="rm65_l5" file="rm65/link5.STL"/>
+    <mesh name="rm65_l6" file="rm65/link6.STL"/>
+    <!-- Dex1-1 夹爪 -->
+    <mesh name="dex_base" file="dex1_1/base_link.STL"/>
+    <mesh name="dex_l1_1" file="dex1_1/Link1_1.STL"/>
+    <mesh name="dex_l1_2" file="dex1_1/Link1_2.STL"/>
+    <mesh name="dex_l1_3" file="dex1_1/Link1_3.STL"/>
+    <mesh name="dex_l2_1" file="dex1_1/Link2_1.STL"/>
+    <mesh name="dex_l2_2" file="dex1_1/Link2_2.STL"/>
+  </asset>
+<worldbody>
+  <!-- ===== 房间：封闭边界（内壁 x=±3.0, y=±2.4, 高 2.6）===== -->
+  <!-- 墙做成 box 而不是 plane：plane 是无限大，围不成房间。
+       墙面 z 从 0 到 2.6，一定要盖过躯干碰撞盒（z 0.476~0.754），
+       否则底盘从墙下面钻过去。 -->
+  <geom name="wall_south" type="box" pos="0 -2.4500 1.3000" size="3.1000 0.0500 1.3000"
+        rgba="0.62 0.62 0.66 1"/>
+  <geom name="wall_north" type="box" pos="0 2.4500 1.3000" size="3.1000 0.0500 1.3000"
+        rgba="0.62 0.62 0.66 1"/>
+  <geom name="wall_west" type="box" pos="-3.0500 0 1.3000" size="0.0500 2.4000 1.3000"
+        rgba="0.58 0.58 0.62 1"/>
+  <geom name="wall_east" type="box" pos="3.0500 0 1.3000" size="0.0500 2.4000 1.3000"
+        rgba="0.58 0.58 0.62 1"/>
+
+  <light name="key" pos="1.5 -1.5 3.0" dir="-0.4 0.4 -1" directional="true" diffuse="0.45 0.45 0.46" ambient="0.10 0.10 0.12" castshadow="true"/>
+  <light name="fill" pos="-1.5 1.5 2.5" dir="0.4 -0.4 -1" directional="true" diffuse="0.22 0.22 0.24" ambient="0.05 0.05 0.06"/>
+  <geom name="floor" type="plane" size="4 4 0.05" material="floor_mat"
+        conaffinity="1" condim="3"/>
+
+  <!-- ===== 工作台（顶面 z=0.65）===== -->
+  <body name="table" pos="0.71 0.0 0.3250">
+    <geom name="table_top" type="box"
+          size="0.29 0.3 0.3250"
+          material="table_mat" conaffinity="1" condim="4" friction="0.9 0.02 0.001"/>
+  </body>
+
+  <!-- ===== 导航障碍物（生成器 OBSTACLES）===== -->
+  <body name="obs_crate_a" pos="-1.4000 0.0000 0.4500">
+    <geom name="obs_crate_a_geom" type="box" size="0.2800 0.2800 0.4500"
+          rgba="0.72 0.55 0.35 1" contype="1" conaffinity="1" condim="3"/>
+  </body>
+  <body name="obs_crate_b" pos="-1.4000 1.7800 0.4500">
+    <geom name="obs_crate_b_geom" type="box" size="0.2200 0.2200 0.4500"
+          rgba="0.70 0.50 0.32 1" contype="1" conaffinity="1" condim="3"/>
+  </body>
+  <body name="obs_crate_c" pos="-1.4000 -1.7800 0.4500">
+    <geom name="obs_crate_c_geom" type="box" size="0.2200 0.2200 0.4500"
+          rgba="0.70 0.50 0.32 1" contype="1" conaffinity="1" condim="3"/>
+  </body>
+  <body name="obs_shelf" pos="-2.8500 0.0000 0.7500">
+    <geom name="obs_shelf_geom" type="box" size="0.1500 0.8500 0.7500"
+          rgba="0.44 0.44 0.48 1" contype="1" conaffinity="1" condim="3"/>
+  </body>
+
+  <!-- ===== P30W 机器狗（固定基座；腿部关节保留但无驱动器）===== -->
+  <!-- ===== 底盘：运动学挂载（SE(2)）===== -->
+  <!-- 三个 joint 挂同一个 body，顺序即 qpos 顺序：x → y → yaw。
+       速度由下方 base_vx/base_vy/base_wz 三个 velocity 执行器给，
+       位置由 MuJoCo 积分 —— 与 P30 SendVelocity 语义一致。 -->
+  <body name="base_planar" pos="0 0 0">
+    <joint name="base_slide_x" type="slide" axis="1 0 0" range="-3.000 3.000"/>
+    <joint name="base_slide_y" type="slide" axis="0 1 0" range="-2.400 2.400"/>
+    <joint name="base_hinge_z" type="hinge" axis="0 0 1"/>
+    <!-- 带 joint 的 body 必须有正质量/惯量，否则 MuJoCo 直接报错。
+         取 0.01 kg / 1e-4 量级，对总质量 (~38 kg) 无影响。 -->
+    <inertial pos="0 0 0" mass="0.01" diaginertia="1e-4 1e-4 1e-4"/>
+        <body name="base_link" pos="0 0 0.6">
+          <inertial pos="0.0001 -0.012 0.012" mass="21.749"
+                    fullinertia="0.1720 0.7258 0.7710 0.0000134 -0.00287 -0.00315"/>
+          <geom class="visual" type="mesh" mesh="trunk_vis" rgba="0.18 0.22 0.20 1"/>
+          <!-- 躯干碰撞盒：顶面必须等于实测躯干最高点 0.754（local 0.154），
+               否则臂基座 z=0.78 会嵌在虚高的碰撞盒里，侧向摆动全被判干涉。 -->
+          <geom name="trunk_col" class="arm" type="box" pos="-0.005 0 0.015"
+                size="0.40 0.14 0.139" rgba="0.18 0.22 0.20 1"/>
+          <site name="imu" pos="0 0 0" size="0.01" rgba="1 0.5 0 1"/>
+
+          <!-- 上装转接板：底面贴躯干顶面、顶面托住机械臂底座，板厚 26mm。
+               z 由 ADAPTER_MID_Z 推出，保证「躯干 → 板 → 臂底座」三者严丝合缝；
+               手写死数值极易再出现 13mm 悬空。 -->
+          <geom name="adapter_plate" class="arm" type="box"
+                pos="0.06 0.0 0.10249999999999992"
+                size="0.14 0.1095 0.0075"
+                rgba="0.35 0.35 0.38 1"/>
+
+          <!-- 狗前方相机（front_cam）：装在 TRUNK.STL 前脸的内凹面板里。
+               === 位置依据（2026-11-10 用户实拍照片 + STL 实测）===
+               用户拍了 P30 前脸实物照片并圈出那块黑色面板，确认相机在那里。
+               TRUNK.STL 上对应的是一块正对 +x 的平板：
+                 x  = 389.7 ~ 390.0 mm      （前脸最前沿）
+                 y  = -59.0 ~ +58.3 mm      （宽 117 mm，居中对称）
+                 z  = +14.5 ~ +81.7 mm      （高 67 mm）
+               117 x 67 mm 是双目深度模组的典型开口；面板后方 x~355mm 处有一圈
+               -x 朝向的背板，构成 35 mm 深的内凹安装槽。
+               相机取面板中心 z=+0.0481（局部），x=0.3900（与面板齐平）。
+
+               === 为什么删掉 cam_mast ===
+               原 head_cam 立在自造立柱顶端（局部 z=0.240），而 TRUNK.STL 最高只有
+               0.1536 —— 那根杆高出去 66.4 mm，真机上没有这个硬件。现改为真机的
+               front_0（Gemini 336L，27 x 124 x 29 mm），立柱整根删除。
+
+               === 朝向：正前方（+x）、下俯 45°，fovy 70（真机内参待标定）===
+               实测（目标在 (0.46,0)，joint6=-90°，姿态 settle 150 步后）：
+                 俯角   PRE目标   GRASP目标   GRASP自遮挡
+                  20°   26.07%     8.03%       81.0%
+                  30°   35.21%    19.45%       73.6%
+                  45°   42.59%    27.11%       58.7%   <- 选中
+                  50°   41.50%    25.34%       53.7%
+               45° 是「深处看得见」与「自遮挡不过半」的拐点，再俯就只看到桌面。
+
+               === 测量陷阱 ===
+               只在模型里写 qpos、不 settle 就渲染，会得到偏乐观的数字（同一姿态
+               0.71% vs 0.00%）。抓取位夹爪要压到方块高度，必须 step 到稳态。
+
+               === 滚转必须用 xyaxes 显式给 ===
+               只写 zaxis 时 MuJoCo 自己补 right（实测画面被转了 90°，四个方块竖着
+               排）。这里显式指定画面右 = 世界 -y（狗朝 +x 时的正常装法）。
+
+               MuJoCo 相机约定：zaxis 是 cam_xmat 第 3 列，前向 = -zaxis；
+               xyaxes 是前两列 (right, up)，右乘关系 right x up = -forward。 -->
+          <camera name="front_cam" pos="0.3900 0.0000 0.0481"
+                  xyaxes="0 -1 0 0.7071 0 0.7071" fovy="70"/>
+
+            <!-- FL 腿 -->
+            <body name="FL_hip" pos="0.3015 0.067 0">
+              <inertial pos="-0.0021206 0.0135996 0.000409" mass="2.348"
+                        diaginertia="0.0041 0.0057 0.0043"/>
+              <joint name="FL_hip_joint" type="hinge" axis="1 0 0" range="-0.7854 0.7854"
+                     stiffness="800" springref="0.0" damping="400"/>
+              <geom class="visual" type="mesh" mesh="hip_L"/>
+              <geom class="arm" type="box" size="0.04 0.05 0.05" rgba="0.25 0.28 0.32 1"/>
+
+              <body name="FL_thigh" pos="0 0.15279 0">
+                <inertial pos="-0.006 0.0287 -0.0433" mass="3.948"
+                          diaginertia="0.0424 0.0427 0.0100"/>
+                <joint name="FL_thigh_joint" type="hinge" axis="0 1 0" range="-1.9373 3.5081"
+                       stiffness="1200" springref="0.723512" damping="600"/>
+                <geom class="visual" type="mesh" mesh="thigh_L"/>
+                <geom class="arm" type="capsule" fromto="0 0 0 0 0 -0.32" size="0.035"
+                      rgba="0.25 0.28 0.32 1"/>
+
+                <body name="FL_calf" pos="0 0 -0.32">
+                  <inertial pos="0.0069 0.0056 -0.2604" mass="1.247"
+                            diaginertia="0.0152 0.0155 0.0011"/>
+                  <joint name="FL_calf_joint" type="hinge" axis="0 1 0" range="-2.6878 -0.5585"
+                         stiffness="1200" springref="-1.386731" damping="600"/>
+                  <geom class="visual" type="mesh" mesh="calf_L"/>
+                  <geom class="arm" type="capsule" fromto="0 0 0 0 0 -0.32" size="0.028"
+                        rgba="0.25 0.28 0.32 1"/>
+
+                  <body name="FL_foot" pos="0 0 -0.32">
+                    <inertial pos="0 0.0594 0" mass="1.338"
+                              diaginertia="0.0048 0.0090 0.0048"/>
+                    <joint name="FL_foot_joint" type="hinge" axis="0 1 0"
+                           stiffness="200" springref="0.663219" damping="100"/>
+                    <geom class="visual" type="mesh" mesh="wheel_L"/>
+                    <!-- 轮子碰撞圆柱：轴向必须沿 y（左右），轮面才是竖直圆盘。
+                         === 这里踩过坑 ===
+                         compiler 是 eulerseq="zyx"，**第一个分量绕 z 转**。圆柱自身轴
+                         就是 z，所以 euler="1.5708 0 0" 等于绕自身轴转 90° —— 毫无作用，
+                         圆柱竖直立着（实测轴向 [0,0,1]，rbound 三角剖分把轮底抬到
+                         z=0.0653）。绕 x 转 90° 要把角度写在**第三个**分量：
+                         euler="0 0 1.5708" → 轴向 [0,±1,0]。 -->
+                    <geom class="arm" type="cylinder" size="0.108 0.0225" pos="0 0.06 0"
+                          euler="0 0 1.5708" rgba="0.15 0.15 0.17 1" friction="1.4 0.02 0.001" contype="0" conaffinity="0"/>
+                  </body>
+                </body>
+              </body>
+            </body>
+
+            <!-- RL 腿 -->
+            <body name="RL_hip" pos="-0.3015 0.067 0">
+              <inertial pos="-0.0021206 0.0135996 0.000409" mass="2.348"
+                        diaginertia="0.0041 0.0057 0.0043"/>
+              <joint name="RL_hip_joint" type="hinge" axis="1 0 0" range="-0.7854 0.7854"
+                     stiffness="800" springref="0.0" damping="400"/>
+              <geom class="visual" type="mesh" mesh="hip_L"/>
+              <geom class="arm" type="box" size="0.04 0.05 0.05" rgba="0.25 0.28 0.32 1"/>
+
+              <body name="RL_thigh" pos="0 0.15279 0">
+                <inertial pos="-0.006 0.0287 -0.0433" mass="3.948"
+                          diaginertia="0.0424 0.0427 0.0100"/>
+                <joint name="RL_thigh_joint" type="hinge" axis="0 1 0" range="-1.9373 3.5081"
+                       stiffness="1200" springref="0.723512" damping="600"/>
+                <geom class="visual" type="mesh" mesh="thigh_L"/>
+                <geom class="arm" type="capsule" fromto="0 0 0 0 0 -0.32" size="0.035"
+                      rgba="0.25 0.28 0.32 1"/>
+
+                <body name="RL_calf" pos="0 0 -0.32">
+                  <inertial pos="0.0069 0.0056 -0.2604" mass="1.247"
+                            diaginertia="0.0152 0.0155 0.0011"/>
+                  <joint name="RL_calf_joint" type="hinge" axis="0 1 0" range="-2.6878 -0.5585"
+                         stiffness="1200" springref="-1.386731" damping="600"/>
+                  <geom class="visual" type="mesh" mesh="calf_L"/>
+                  <geom class="arm" type="capsule" fromto="0 0 0 0 0 -0.32" size="0.028"
+                        rgba="0.25 0.28 0.32 1"/>
+
+                  <body name="RL_foot" pos="0 0 -0.32">
+                    <inertial pos="0 0.0594 0" mass="1.338"
+                              diaginertia="0.0048 0.0090 0.0048"/>
+                    <joint name="RL_foot_joint" type="hinge" axis="0 1 0"
+                           stiffness="200" springref="0.663219" damping="100"/>
+                    <geom class="visual" type="mesh" mesh="wheel_L"/>
+                    <!-- 轮子碰撞圆柱：轴向必须沿 y（左右），轮面才是竖直圆盘。
+                         === 这里踩过坑 ===
+                         compiler 是 eulerseq="zyx"，**第一个分量绕 z 转**。圆柱自身轴
+                         就是 z，所以 euler="1.5708 0 0" 等于绕自身轴转 90° —— 毫无作用，
+                         圆柱竖直立着（实测轴向 [0,0,1]，rbound 三角剖分把轮底抬到
+                         z=0.0653）。绕 x 转 90° 要把角度写在**第三个**分量：
+                         euler="0 0 1.5708" → 轴向 [0,±1,0]。 -->
+                    <geom class="arm" type="cylinder" size="0.108 0.0225" pos="0 0.06 0"
+                          euler="0 0 1.5708" rgba="0.15 0.15 0.17 1" friction="1.4 0.02 0.001" contype="0" conaffinity="0"/>
+                  </body>
+                </body>
+              </body>
+            </body>
+
+            <!-- FR 腿 -->
+            <body name="FR_hip" pos="0.3015 -0.067 0">
+              <inertial pos="-0.0021206 -0.0135996 0.000409" mass="2.348"
+                        diaginertia="0.0041 0.0057 0.0043"/>
+              <joint name="FR_hip_joint" type="hinge" axis="1 0 0" range="-0.7854 0.7854"
+                     stiffness="800" springref="0.0" damping="400"/>
+              <geom class="visual" type="mesh" mesh="hip_R"/>
+              <geom class="arm" type="box" size="0.04 0.05 0.05" rgba="0.25 0.28 0.32 1"/>
+
+              <body name="FR_thigh" pos="0 -0.15279 0">
+                <inertial pos="-0.006 -0.0287 -0.0433" mass="3.948"
+                          diaginertia="0.0424 0.0427 0.0100"/>
+                <joint name="FR_thigh_joint" type="hinge" axis="0 1 0" range="-1.9373 3.5081"
+                       stiffness="1200" springref="0.723512" damping="600"/>
+                <geom class="visual" type="mesh" mesh="thigh_R"/>
+                <geom class="arm" type="capsule" fromto="0 0 0 0 0 -0.32" size="0.035"
+                      rgba="0.25 0.28 0.32 1"/>
+
+                <body name="FR_calf" pos="0 0 -0.32">
+                  <inertial pos="0.0069 -0.0056 -0.2604" mass="1.247"
+                            diaginertia="0.0152 0.0155 0.0011"/>
+                  <joint name="FR_calf_joint" type="hinge" axis="0 1 0" range="-2.6878 -0.5585"
+                         stiffness="1200" springref="-1.386731" damping="600"/>
+                  <geom class="visual" type="mesh" mesh="calf_R"/>
+                  <geom class="arm" type="capsule" fromto="0 0 0 0 0 -0.32" size="0.028"
+                        rgba="0.25 0.28 0.32 1"/>
+
+                  <body name="FR_foot" pos="0 0 -0.32">
+                    <inertial pos="0 -0.0594 0" mass="1.338"
+                              diaginertia="0.0048 0.0090 0.0048"/>
+                    <joint name="FR_foot_joint" type="hinge" axis="0 1 0"
+                           stiffness="200" springref="0.663219" damping="100"/>
+                    <geom class="visual" type="mesh" mesh="wheel_R"/>
+                    <!-- 轮子碰撞圆柱：轴向必须沿 y（左右），轮面才是竖直圆盘。
+                         === 这里踩过坑 ===
+                         compiler 是 eulerseq="zyx"，**第一个分量绕 z 转**。圆柱自身轴
+                         就是 z，所以 euler="1.5708 0 0" 等于绕自身轴转 90° —— 毫无作用，
+                         圆柱竖直立着（实测轴向 [0,0,1]，rbound 三角剖分把轮底抬到
+                         z=0.0653）。绕 x 转 90° 要把角度写在**第三个**分量：
+                         euler="0 0 1.5708" → 轴向 [0,±1,0]。 -->
+                    <geom class="arm" type="cylinder" size="0.108 0.0225" pos="0 -0.06 0"
+                          euler="0 0 1.5708" rgba="0.15 0.15 0.17 1" friction="1.4 0.02 0.001" contype="0" conaffinity="0"/>
+                  </body>
+                </body>
+              </body>
+            </body>
+
+            <!-- RR 腿 -->
+            <body name="RR_hip" pos="-0.3015 -0.067 0">
+              <inertial pos="-0.0021206 -0.0135996 0.000409" mass="2.348"
+                        diaginertia="0.0041 0.0057 0.0043"/>
+              <joint name="RR_hip_joint" type="hinge" axis="1 0 0" range="-0.7854 0.7854"
+                     stiffness="800" springref="0.0" damping="400"/>
+              <geom class="visual" type="mesh" mesh="hip_R"/>
+              <geom class="arm" type="box" size="0.04 0.05 0.05" rgba="0.25 0.28 0.32 1"/>
+
+              <body name="RR_thigh" pos="0 -0.15279 0">
+                <inertial pos="-0.006 -0.0287 -0.0433" mass="3.948"
+                          diaginertia="0.0424 0.0427 0.0100"/>
+                <joint name="RR_thigh_joint" type="hinge" axis="0 1 0" range="-1.9373 3.5081"
+                       stiffness="1200" springref="0.723512" damping="600"/>
+                <geom class="visual" type="mesh" mesh="thigh_R"/>
+                <geom class="arm" type="capsule" fromto="0 0 0 0 0 -0.32" size="0.035"
+                      rgba="0.25 0.28 0.32 1"/>
+
+                <body name="RR_calf" pos="0 0 -0.32">
+                  <inertial pos="0.0069 -0.0056 -0.2604" mass="1.247"
+                            diaginertia="0.0152 0.0155 0.0011"/>
+                  <joint name="RR_calf_joint" type="hinge" axis="0 1 0" range="-2.6878 -0.5585"
+                         stiffness="1200" springref="-1.386731" damping="600"/>
+                  <geom class="visual" type="mesh" mesh="calf_R"/>
+                  <geom class="arm" type="capsule" fromto="0 0 0 0 0 -0.32" size="0.028"
+                        rgba="0.25 0.28 0.32 1"/>
+
+                  <body name="RR_foot" pos="0 0 -0.32">
+                    <inertial pos="0 -0.0594 0" mass="1.338"
+                              diaginertia="0.0048 0.0090 0.0048"/>
+                    <joint name="RR_foot_joint" type="hinge" axis="0 1 0"
+                           stiffness="200" springref="0.663219" damping="100"/>
+                    <geom class="visual" type="mesh" mesh="wheel_R"/>
+                    <!-- 轮子碰撞圆柱：轴向必须沿 y（左右），轮面才是竖直圆盘。
+                         === 这里踩过坑 ===
+                         compiler 是 eulerseq="zyx"，**第一个分量绕 z 转**。圆柱自身轴
+                         就是 z，所以 euler="1.5708 0 0" 等于绕自身轴转 90° —— 毫无作用，
+                         圆柱竖直立着（实测轴向 [0,0,1]，rbound 三角剖分把轮底抬到
+                         z=0.0653）。绕 x 转 90° 要把角度写在**第三个**分量：
+                         euler="0 0 1.5708" → 轴向 [0,±1,0]。 -->
+                    <geom class="arm" type="cylinder" size="0.108 0.0225" pos="0 -0.06 0"
+                          euler="0 0 1.5708" rgba="0.15 0.15 0.17 1" friction="1.4 0.02 0.001" contype="0" conaffinity="0"/>
+                  </body>
+                </body>
+              </body>
+            </body>
+          <!-- ===== RM65 机械臂（安装在躯干顶部）===== -->
+          <body name="arm_base_link" pos="0.06 0.0 0.11"
+                euler="3.141593 0 0">
+            <inertial pos="0 0 0.07" mass="1.033" diaginertia="0.002 0.002 0.002"/>
+            <geom class="visual" type="mesh" mesh="rm65_base" rgba="0.62 0.62 0.66 1"/>
+            <geom class="arm" type="cylinder" size="0.06 0.035" pos="0 0 0.035" rgba="0.5 0.5 0.54 1"/>
+
+            <body name="arm_Link1" pos="0 0 0.2405">
+              <joint name="arm_joint1" type="hinge" axis="0 0 1" range="-3.1 3.1"/>
+              <inertial pos="0 0 0.075" mass="0.716" diaginertia="0.0012 0.0012 0.0011"/>
+              <geom class="visual" type="mesh" mesh="rm65_l1" rgba="0.6 0.6 0.63 1"/>
+              <geom class="arm" type="capsule" fromto="0 0 0 0 0 0.16" size="0.05" rgba="0.55 0.55 0.58 1"/>
+
+              <body name="arm_Link2" pos="0 0 0" euler="0 -1.5708 1.5708">
+                <joint name="arm_joint2" type="hinge" axis="0 0 1" range="-2.268 2.268"/>
+                <inertial pos="0 0.128 0" mass="1.301" diaginertia="0.006 0.006 0.0015"/>
+                <geom class="visual" type="mesh" mesh="rm65_l2" rgba="0.6 0.6 0.63 1"/>
+                <geom class="arm" type="capsule" fromto="0 0 0 0.256 0 0" size="0.045" rgba="0.55 0.55 0.58 1"/>
+
+                <body name="arm_Link3" pos="0.256 0 0" euler="1.5708 0 0">
+                  <joint name="arm_joint3" type="hinge" axis="0 0 1" range="-2.355 2.355"/>
+                  <inertial pos="0 -0.105 0" mass="0.350" diaginertia="0.0012 0.0012 0.0004"/>
+                  <geom class="visual" type="mesh" mesh="rm65_l3" rgba="0.6 0.6 0.63 1"/>
+                  <geom class="arm" type="capsule" fromto="0 0 0 0 -0.21 0" size="0.04" rgba="0.55 0.55 0.58 1"/>
+
+                  <body name="arm_Link4" pos="0 -0.21 0" euler="0 0 1.5708">
+                    <joint name="arm_joint4" type="hinge" axis="0 0 1" range="-3.1 3.1"/>
+                    <inertial pos="0 0 -0.04" mass="0.294" diaginertia="0.0006 0.0006 0.0004"/>
+                    <geom class="visual" type="mesh" mesh="rm65_l4" rgba="0.6 0.6 0.63 1"/>
+                    <geom class="arm" type="capsule" fromto="0 0 0 0 0 -0.144" size="0.035" rgba="0.55 0.55 0.58 1"/>
+
+                    <body name="arm_Link5" pos="0 0 0" euler="0 0 -1.5708">
+                      <joint name="arm_joint5" type="hinge" axis="0 0 1" range="-2.233 2.233"/>
+                      <inertial pos="0 0 0" mass="0.278" diaginertia="0.0003 0.0003 0.0003"/>
+                      <geom class="visual" type="mesh" mesh="rm65_l5" rgba="0.6 0.6 0.63 1"/>
+                      <geom class="arm" type="capsule" fromto="0 0 0 0 -0.05 0" size="0.032" rgba="0.55 0.55 0.58 1"/>
+
+                      <body name="arm_Link6" pos="0 -0.144 0" euler="0 0 1.5708">
+                        <joint name="arm_joint6" type="hinge" axis="0 0 1" range="-6.28 6.28"/>
+                        <inertial pos="0 0 0" mass="0.085" diaginertia="0.0001 0.0001 0.0001"/>
+                        <geom class="visual" type="mesh" mesh="rm65_l6" rgba="0.62 0.62 0.65 1"/>
+                        <geom class="arm" type="cylinder" size="0.03 0.02" euler="1.5708 0 0"
+                              rgba="0.5 0.5 0.54 1"/>
+                        <!-- 法兰中心：IK / 位姿记录基准 -->
+                        <site name="eef_site" pos="0 0 0" size="0.008" rgba="1 0 0 1"/>
+
+                        <!-- Dex1-1 二指夹爪 -->
+                        <body name="gripper_base" pos="0 0 0" euler="0 0 1.5708">
+                          <inertial pos="0 0 0.05" mass="0.578" diaginertia="0.0015 0.0015 0.0008"/>
+                          <geom class="visual" type="mesh" mesh="dex_base" rgba="0.5 0.5 0.53 1"/>
+                          <!-- 夹持面中心 TCP。
+                               实测：指垫中心在 gripper_base 系 = (0.04355, 0.1113, 0.0002)，
+                               两指关于 y-z 面对称，故 TCP 取 (0, 0.1113, 0.0002)。
+                               原先写 0.0986 会让 TCP 比实际夹持点靠后 1.27cm，
+                               IK 收敛后指垫会插进台面 2.2cm。 -->
+                          <site name="grasp_site" pos="0 0.1113 0.0002"
+                                size="0.008" rgba="1 1 0 1"/>
+                          <!-- 手眼相机（arm_cam）：装在 Dex1-1 夹爪顶部凸台上。
+                               === 位置依据（2026-11-10 核实）===
+                               Dex1-1 官方 URDF 只有 6 个 link，没有任何 camera node，
+                               只能从官方 base_link.STL 找安装座：顶部唯一的凸台
+                                 z[0.0553,0.0700]  x ±18 mm  y [22.8, 57.0] mm  <- 大台面
+                                 z[0.0700,0.0890]  x ±17 mm  y [43.6, 52.9] mm  <- 上方小凸块
+                               相机取大台面前缘 y=0.0575、贴面 z=0.0650，光轴沿 +y
+                               （朝夹持方向）下俯 40°。原 (0,-0.080,0.100) 离最近夹爪
+                               表面 104.7 mm，是悬空的，已废弃。
+                               === 40° 的取舍（settle 后实测）===
+                                 θ     PRE     HOVER   GRASP   自遮挡
+                                 20°  1.59%   4.07%   6.27%    9.4%
+                                 30°  1.73%   3.99%   5.73%   21.1%
+                                 40°  2.09%   4.34%   4.53%   31.7%  <- 选中
+                                 45°  2.39%   4.69%   4.15%   35.9%
+                                 60°  1.34%   6.07%   3.95%   40.2%
+                               眼在手相机紧贴夹爪，目标占 2~6% 属正常。40° 四阶段最均衡。
+                               前向 = -zaxis（MuJoCo 约定），故 zaxis = (0,-0.7660,0.6428)。 -->
+                          <camera name="arm_cam" pos="0.0000 0.0575 0.0650"
+                                  zaxis="0 -0.7660 0.6428" fovy="85"/>
+
+                          <body name="finger_left" pos="0.04055 0.0593 0.0152">
+                            <joint name="gripper_left_joint" type="slide" axis="-1 0 0"
+                                   range="-0.02 0.0245"/>
+                            <inertial pos="0 0.05 0" mass="0.25" diaginertia="0.0002 0.0002 0.0001"/>
+                            <geom class="visual" type="mesh" mesh="dex_l1_1" rgba="0.5 0.5 0.53 1"/>
+                            <geom class="visual" type="mesh" mesh="dex_l1_2" pos="-0.013 0.013 0"
+                                  contype="0" conaffinity="0" rgba="0.5 0.5 0.53 1"/>
+                            <geom class="visual" type="mesh" mesh="dex_l1_3" pos="-0.0155 0.038 -0.001"
+                                  contype="0" conaffinity="0" rgba="0.5 0.5 0.53 1"/>
+                            <!-- 指垫颜色**必须低饱和中性灰**（2026-11-10）：
+                                 原来是 (0.85,0.25,0.20) 红色，与红色方块同色系。
+                                 arm_cam 紧贴夹爪，两根指垫各占画面一侧、面积约 1750 px，
+                                 比目标方块还大；HSV 按面积排序时稳定误选指垫，
+                                 实测定位跑到 340 mm 外。改成灰后只靠色相即可排除。 -->
+                            <geom name="finger_left_pad" type="box" pos="0.003 0.052 -0.015"
+                                  size="0.003 0.027 0.014" rgba="0.42 0.42 0.44 1"
+                                  friction="2 1 0.005" contype="2" conaffinity="1"/>
+                          </body>
+
+                          <body name="finger_right" pos="-0.04055 0.0593 -0.0152">
+                            <joint name="gripper_right_joint" type="slide" axis="1 0 0"
+                                   range="-0.02 0.0245"/>
+                            <inertial pos="0 0.05 0" mass="0.25" diaginertia="0.0002 0.0002 0.0001"/>
+                            <geom class="visual" type="mesh" mesh="dex_l2_1" rgba="0.5 0.5 0.53 1"/>
+                            <geom class="visual" type="mesh" mesh="dex_l2_2" pos="0.013 0.013 0"
+                                  contype="0" conaffinity="0" rgba="0.5 0.5 0.53 1"/>
+                            <geom name="finger_right_pad" type="box" pos="-0.003 0.052 0.015"
+                                  size="0.003 0.027 0.014" rgba="0.42 0.42 0.44 1"
+                                  friction="2 1 0.005" contype="2" conaffinity="1"/>
+                          </body>
+                        </body>
+                      </body>
+                    </body>
+                  </body>
+                </body>
+              </body>
+            </body>
+          </body>
+        </body>
+  </body>
+
+  <!-- ===== 目标/干扰物体（位置由采集脚本随机化，这里给默认摆位）===== -->
+
+  <body name="obj_0" pos="0.47 -0.15000000000000002 0.6800">
+    <freejoint name="obj_0_joint"/>
+    <inertial pos="0 0 0" mass="0.050" diaginertia="3e-5 3e-5 3e-5"/>
+    <geom name="obj_0_geom" class="cube" rgba="0.85 0.15 0.12 1"/>
+  </body>
+  <body name="obj_1" pos="0.47 -0.04999999999999999 0.6800">
+    <freejoint name="obj_1_joint"/>
+    <inertial pos="0 0 0" mass="0.050" diaginertia="3e-5 3e-5 3e-5"/>
+    <geom name="obj_1_geom" class="cube" rgba="0.15 0.60 0.25 1"/>
+  </body>
+  <body name="obj_2" pos="0.47 0.04999999999999999 0.6800">
+    <freejoint name="obj_2_joint"/>
+    <inertial pos="0 0 0" mass="0.050" diaginertia="3e-5 3e-5 3e-5"/>
+    <geom name="obj_2_geom" class="cube" rgba="0.15 0.30 0.80 1"/>
+  </body>
+  <body name="obj_3" pos="0.47 0.15000000000000002 0.6800">
+    <freejoint name="obj_3_joint"/>
+    <inertial pos="0 0 0" mass="0.050" diaginertia="3e-5 3e-5 3e-5"/>
+    <geom name="obj_3_geom" class="cube" rgba="0.90 0.75 0.10 1"/>
+  </body>
+  <camera name="debug_iso" pos="1.9 -1.6 1.6" xyaxes="0.64 0.77 0 -0.34 0.28 0.90" fovy="55"/>
+</worldbody>
+
+  <keyframe>
+    <!-- 官方 URDF 站立位姿 + 机械臂前伸待抓 + 夹爪张开；物体保持默认摆位 -->
+    <key name="stand" qpos="0 0 0 0.0 0.723512 -1.386731 0.663219 0.0 0.723512 -1.386731 0.663219 0.0 0.723512 -1.386731 0.663219 0.0 0.723512 -1.386731 0.663219 0.00000 1.11876 0.48695 0.00000 1.53589 -5.78751 -0.02 -0.02 0.47 -0.15000000000000002 0.6800 1 0 0 0 0.47 -0.04999999999999999 0.6800 1 0 0 0 0.47 0.04999999999999999 0.6800 1 0 0 0 0.47 0.15000000000000002 0.6800 1 0 0 0"
+         ctrl="0.00000 1.11876 0.48695 0.00000 1.53589 -5.78751 -0.02 -0.02 0 0 0"/>
+  </keyframe>
+
+  <actuator>
+    <!-- RM65 六轴位置控制 -->
+    <position name="m1" joint="arm_joint1" kp="300" kv="30" ctrlrange="-3.1 3.1"/>
+    <position name="m2" joint="arm_joint2" kp="300" kv="30" ctrlrange="-2.268 2.268"/>
+    <position name="m3" joint="arm_joint3" kp="250" kv="25" ctrlrange="-2.355 2.355"/>
+    <position name="m4" joint="arm_joint4" kp="120" kv="12" ctrlrange="-3.1 3.1"/>
+    <position name="m5" joint="arm_joint5" kp="100" kv="10" ctrlrange="-2.233 2.233"/>
+    <position name="m6" joint="arm_joint6" kp="60" kv="6" ctrlrange="-6.28 6.28"/>
+    <!-- Dex1-1 夹爪 -->
+    <position name="grip_l" joint="gripper_left_joint" kp="400" kv="20" ctrlrange="-0.02 0.0245"/>
+    <position name="grip_r" joint="gripper_right_joint" kp="400" kv="20" ctrlrange="-0.02 0.0245"/>
+    <!-- ===== 底盘速度执行器（追加，不能插到 m1 前面：
+         keyframe 的 ctrl 顺序依赖这个编号）===== -->
+    <velocity name="base_vx" joint="base_slide_x" kv="3000"
+              ctrlrange="-0.6 0.6"/>
+    <velocity name="base_vy" joint="base_slide_y" kv="3000"
+              ctrlrange="-0.4 0.4"/>
+    <velocity name="base_wz" joint="base_hinge_z" kv="2000"
+              ctrlrange="-0.8 0.8"/>
+  </actuator>
+
+  <sensor>
+    <framepos name="eef_pos" objtype="site" objname="eef_site"/>
+    <framequat name="eef_quat" objtype="site" objname="eef_site"/>
+    <framepos name="grasp_pos" objtype="site" objname="grasp_site"/>
+    <jointpos name="q1" joint="arm_joint1"/>
+    <jointpos name="q2" joint="arm_joint2"/>
+    <jointpos name="q3" joint="arm_joint3"/>
+    <jointpos name="q4" joint="arm_joint4"/>
+    <jointpos name="q5" joint="arm_joint5"/>
+    <jointpos name="q6" joint="arm_joint6"/>
+  </sensor>
+</mujoco>

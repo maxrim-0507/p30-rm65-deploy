@@ -1,0 +1,459 @@
+# -*- coding: utf-8 -*-
+"""PERCEPT NAV：真感知的「找到 → 泊车 → 收臂交班」。
+
+=== 这个类只做决策，不碰硬件 ===
+底盘速度、取图、检测、反投影、抬臂预设都可以注入，所以：
+  - 仿真里用 MuJoCo 后端，真机换 RealBackend 不用改这里；
+  - 单测用假 backend + 假相机，不需要 MuJoCo/cv2。
+
+=== 相位 ===
+    SEARCH    SEARCH_Q 抬臂 + 原地扫（arm_cam 远距离可见扇区大）
+    APPROACH  SEARCH_Q 下视觉泊车：目标在首次捕获时锁存，机体系 P 控制
+    TUCK      FWD2（v36 训练首帧，arm_cam 朝前）—— 交班前必须回去
+    DONE / FAILED
+
+=== 为什么 SEARCH 和 APPROACH 用同一个预设 ===
+本地实测（320×240 针孔投影，arm_cam）：
+    SEARCH_Q  底盘 x ≤ −0.21 时目标在画面内（v≤238），x=0 时 v=413 已经出画
+    FWD2      泊车盒 x∈[−0.34,−0.12] 全程可见（v=112~135）
+也就是说 SEARCH_Q 恰好覆盖「远距离 + 泊车盒后半段」，而泊车盒前缘
+（x>−0.21）会差 0~9 cm 丢目标。丢目标一律先停车；只要此时已在交班盒
+（缺省 0.12 m / 0.15 rad）内就照常 TUCK —— VLA 实测能吸收 ±0.40 m
+起点误差，这 9 cm 不该拿成功率去赌二次泊车。
+
+=== 为什么必须先锁存再开 ===
+每帧用「当前车→目标」重算泊车位，车一动泊车位就跟着动，闭环会追
+自己的影子。VisualDock 在首次观测时锁存，这里把搜索命中的那一帧
+反投影结果作为首个观测喂进去，保证与搜索用的是同一个点。
+
+=== 真值调用必须为 0 ===
+本模块只有一条定位路径：图像 HSV → 台面反投影。没有 get_objects /
+仿真真值的分支，`truth_calls` 恒为 0。评测脚本会断言这一点。
+"""
+import time
+
+import numpy as np
+
+from ..perception.tracking import BlobTracker, scale_min_area
+from ..spec import CUBE_HALF, GROUND_BOUNDS, TABLE_TOP_Z, camera_mjcf
+from .handoff import make_armcam_visibility_fn, make_fwd2_preset
+from .presets import SEARCH_Q_DEG
+from .search import Phase as SearchPhase
+from .search import SearchBehavior
+from .visual_dock import DockPhase, VisualDock
+
+DEFAULTS = {
+    # 控制节奏：演示里 12.5 Hz。L3 的 200 ms 看门狗需要 ≤ 80 ms 刷新一次。
+    "frame_dt": 0.08,
+    # 交班盒：泊车到此范围内即可交给 VLA（与 deploy.yaml 的 pose_tol 同量级）
+    "near_xy": 0.05,
+    "near_yaw": 0.15,
+    # 视觉在终点前丢失时的降级交班盒。必须比 near_* 宽，否则永远不会生效：
+    # 若丢失那一刻误差已在 near_* 内，上一帧新鲜观测就会先判 ARRIVED。
+    # 0.25 m / 0.30 rad 仍在 v36 实测吸收范围（±0.40 m / ±0.30 rad）内。
+    "lost_xy": 0.25,
+    "lost_yaw": 0.30,
+    # 观测容忍：检测抖动掉帧不超过这个时长就继续按锁存车位开
+    "stale_s": 0.5,
+    # 盲走收尾（见 visual_dock 模块文档）：车位已锁存且离车位够近时，
+    # 允许超出 stale_s 再盲开 blind_goal_s；太远一律不盲开。
+    "blind_goal_s": 2.0,
+    "blind_goal_max_err": 0.45,
+    # TUCK 后 FWD2 下 arm_cam 的可见性硬闸（与 handoff.vis_min_px 一致）
+    "vis_min_px": 50.0,
+    "max_search_s": 60.0,
+    "max_approach_s": 45.0,
+    # 基准检测面积（320×240 下 25 px），其它分辨率按面积缩放
+    "min_area_px": 25.0,
+    # 色溢剔除门限：同色候选与另一颜色块重合 <= 此距离判为色溢
+    "bleed_gate": 0.05,
+    "realtime_sleep": True,
+}
+
+
+class NavPhase(object):
+    SEARCH = "search"
+    APPROACH = "approach"
+    TUCK = "tuck"
+    DONE = "done"
+    FAILED = "failed"
+
+    TERMINAL = (DONE, FAILED)
+
+
+class NavResult(object):
+    """一次「找 + 泊 + 交班姿势」的结果。调用方只需要 target_xy。"""
+
+    __slots__ = ("ok", "phase", "color", "target_xy", "goal", "vis_px",
+                 "err_xy", "err_yaw", "frames", "reason", "phases",
+                 "sources", "truth_calls")
+
+    def __init__(self, ok, phase, color=None, target_xy=None, goal=None,
+                 vis_px=None, err_xy=None, err_yaw=None, frames=None,
+                 reason="", phases=None, sources=(), truth_calls=0):
+        self.ok = bool(ok)
+        self.phase = phase
+        self.color = color
+        self.target_xy = (None if target_xy is None
+                          else (float(target_xy[0]), float(target_xy[1])))
+        self.goal = None if goal is None else np.asarray(goal, float).copy()
+        self.vis_px = vis_px
+        self.err_xy = err_xy
+        self.err_yaw = err_yaw
+        self.frames = dict(frames or {})
+        self.reason = str(reason or "")
+        self.phases = list(phases or [])
+        self.sources = tuple(sources)
+        self.truth_calls = int(truth_calls)
+
+    def __repr__(self):
+        return ("NavResult(ok=%s, phase=%s, %s, xy=%s, vis=%s, reason=%r)"
+                % (self.ok, self.phase, self.color, self.target_xy,
+                   None if self.vis_px is None else round(self.vis_px, 1),
+                   self.reason))
+
+
+def _wrap_pi(a):
+    return float(np.arctan2(np.sin(a), np.cos(a)))
+
+
+class PerceptNav(object):
+    """找目标 + 视觉泊车 + 收臂。一次 run() 对应一个 episode。"""
+
+    def __init__(self, backend, color, cfg=None, camera=None,
+                 detect_fn=None, tracker=None, locate_fn=None,
+                 search_preset_fn=None, tuck_preset_fn=None,
+                 visibility_fn=None, clock=None, sleep_fn=None,
+                 verbose=True):
+        """全部硬件交互都注入：
+        backend          RobotBackend（仿真 / LocalBackend / RealBackend）
+        color            目标颜色（"red" 等）
+        camera           搜索/泊车相机逻辑名（缺省 arm）
+        detect_fn        (img, color, min_area) -> detect_blobs 结构
+        locate_fn        () -> {"ok","xy"} | None；缺省用图像+反投影
+        search_preset_fn () -> (ok, msg)；抬到 SEARCH_Q（阻塞）
+        tuck_preset_fn   () -> (ok, msg)；回到 FWD2（阻塞）
+        visibility_fn    () -> 目标像素数 | None；缺省 HSV 检测 arm_cam
+        """
+        self.backend = backend
+        self.color = color
+        self.cfg = dict(DEFAULTS)
+        if cfg:
+            self.cfg.update(cfg)
+        self.camera = camera or camera_mjcf("arm")
+        self.detect_fn = detect_fn
+        self.tracker = tracker or BlobTracker()
+        self._locate_fn = locate_fn
+        self._clock = clock or time.monotonic
+        self._sleep_fn = sleep_fn or time.sleep
+        self.verbose = bool(verbose)
+
+        self._search_preset = search_preset_fn or make_fwd2_preset(
+            backend, q_deg=SEARCH_Q_DEG)
+        self._tuck = tuck_preset_fn or make_fwd2_preset(backend)
+        self._visibility = visibility_fn or make_armcam_visibility_fn(
+            backend, color, camera_name=self.camera, min_area=8)
+
+        self._min_area = None
+        self._loc_xy = None            # 上一帧选中的目标 xy（时间连续性）
+        self._truth_calls = 0          # 恒为 0：本类不读真值
+        self.frames = {"search": 0, "approach": 0}
+        self.phases = []
+        self.sources = set()
+
+    # ---------- 主入口 ----------
+    def run(self):
+        try:
+            return self._run()
+        except Exception as e:          # 注入回调/后端异常都要落到 FAILED
+            self._stop()
+            return self._fail("异常：%s" % e)
+
+    def _run(self):
+        t0 = self._clock()
+
+        # ---- 1. SEARCH ----
+        sh = SearchBehavior(
+            self._search_preset, self.backend.get_images, self.color,
+            self.camera, self._detect, self._get_yaw, tracker=self.tracker,
+            clock=self._clock, accept_fn=self._accept_blobs)
+        while True:
+            st = sh.tick()
+            self.frames["search"] += 1
+            if st.done:
+                break
+            self._drive(st.vx, st.vy, st.wz)
+            if self._clock() - t0 > self.cfg["max_search_s"]:
+                self._stop()
+                return self._fail("搜索超时 %.0f s" % self.cfg["max_search_s"],
+                                  sh)
+            self._sleep()
+        # FOUND 的 status 速度是 0，但上一帧的 wz 还留在底盘里，显式停一次
+        self._stop()
+        self._mark(NavPhase.SEARCH, sh.reason or "找到目标")
+        if sh.phase != SearchPhase.FOUND:
+            return self._fail("搜索失败：%s" % sh.reason, sh)
+
+        uv = (st.track.uv if st.track is not None else None)
+        xy = self._project(uv) if uv is not None else None
+        self._loc_xy = xy             # 泊车阶段以搜索命中点为跟踪起点
+        if xy is None:
+            return self._fail("检测到目标但反投影越出台面（uv=%s）" % (uv,),
+                              sh)
+
+        # ---- 2. APPROACH（视觉泊车）----
+        near_xy = float(self.cfg["near_xy"])
+        near_yaw = float(self.cfg["near_yaw"])
+        max_frames = max(1, int(self.cfg["max_approach_s"]
+                                / float(self.cfg["frame_dt"])))
+        dock = VisualDock(
+            self._locate, self._get_pose,
+            cfg={"tol_xy": near_xy, "tol_yaw": near_yaw,
+                 "max_frames": max_frames,
+                 "stale_s": float(self.cfg["stale_s"]),
+                 "blind_goal_s": float(self.cfg["blind_goal_s"]),
+                 "blind_goal_max_err": float(
+                     self.cfg["blind_goal_max_err"])},
+            clock=self._clock)
+        # 首个观测用搜索命中的那一帧，保证泊车位与搜索同源、且立即锁存
+        st = dock.tick(obs={"ok": True, "xy": xy})
+        lost_inside = False
+        while True:
+            if st.phase == DockPhase.TRACK:
+                self._drive(st.vx, st.vy, st.wz)
+            elif st.phase == DockPhase.ARRIVED:
+                break
+            elif st.phase == DockPhase.LOST:
+                # 视觉在近处丢了：只要已在**降级**交班盒内就照常收臂
+                if self._in_box(dock.goal, self.cfg["lost_xy"],
+                                self.cfg["lost_yaw"]):
+                    lost_inside = True
+                    break
+                self._stop()
+                return self._fail("泊车途中目标丢失且不在降级交班盒：%s"
+                                  % st.reason)
+            elif st.phase == DockPhase.FAILED:
+                self._stop()
+                return self._fail("泊车失败：%s" % st.reason)
+            self._sleep()
+            st = dock.tick()
+            self.frames["approach"] += 1
+
+        self._stop()
+        err_xy, err_yaw = self._goal_err(dock.goal)
+        tol_xy = float(self.cfg["lost_xy"] if lost_inside else near_xy)
+        tol_yaw = float(self.cfg["lost_yaw"] if lost_inside else near_yaw)
+        self._mark(NavPhase.APPROACH,
+                   "泊车到位（残差 %.3f m / %.3f rad%s）"
+                   % (err_xy, err_yaw, "，视觉近处丢失" if lost_inside else ""))
+        if err_xy > tol_xy or abs(err_yaw) > tol_yaw:
+            return self._fail("泊车残差超交班盒：%.3f m / %.3f rad"
+                              % (err_xy, err_yaw))
+
+        # ---- 3. TUCK（FWD2 交班姿态）----
+        ok, msg = self._tuck()
+        if not ok:
+            return self._fail("FWD2 预设失败：%s" % msg)
+        vis = self._visibility()
+        if vis is None:
+            return self._fail("arm_cam 无图像，无法确认目标可见")
+        if vis < float(self.cfg["vis_min_px"]):
+            return self._fail("FWD2 下目标仅 %.0f px < %.0f px"
+                              % (vis, self.cfg["vis_min_px"]))
+        self._mark(NavPhase.TUCK, "FWD2 到位（%s），目标可见 %.0f px"
+                   % (msg, vis))
+
+        return NavResult(
+            True, NavPhase.DONE, self.color, xy, dock.goal, vis,
+            err_xy, err_yaw, self.frames,
+            reason="找到并泊车到交班盒", phases=self.phases,
+            sources=self.sources, truth_calls=self._truth_calls)
+
+    # ---------- 感知 ----------
+    def _detect(self, img, color, min_area):
+        if self.detect_fn is None:
+            from ..perception.color_grounding import detect_blobs
+            self.detect_fn = detect_blobs
+        return self.detect_fn(img, color, min_area)
+
+    def _locate(self):
+        """VisualDock 的定位回调：(图像 → 候选色块 → 台面反投影)。
+
+        多候选处理顺序：
+          1. 先剔除反投影越出台面的（边缘剪影 / 背景）；
+          2. 剔除落在**其它颜色方块**上的同色色溢伪点（见 _reject_bleed）；
+          3. 余下按「离上一帧选中点最近」挑（目标静止，时间连续性）。
+        第 3 步的必要性：实测 seed 2 每帧都有真块 y≈0.20 与伪块 y≈−0.07，
+        面积只差几像素；按面积挑会逐帧跳，方位角瞬跳 ~0.3 rad，泊车原地
+        打转到帧预算耗尽（2026-11-22 本机真 HSV 实测）。
+        """
+        imgs = self.backend.get_images() or {}
+        img = imgs.get(self.camera)
+        if img is None:
+            return None
+        if self._min_area is None:
+            self._min_area = scale_min_area(
+                float(self.cfg["min_area_px"]),
+                img.shape[1], img.shape[0])
+        blobs = self._detect(img, self.color, self._min_area)
+        if not blobs:
+            return None
+        inb = [b for b in blobs if self._project(b["uv"]) is not None]
+        if not inb:
+            return None
+        inb = self._reject_bleed(inb, img, self._min_area)
+        cand = [(self._project(b["uv"]), int(b["area"])) for b in inb]
+        if self._loc_xy is None:
+            best = max(cand, key=lambda c: c[1])
+        else:
+            best = min(cand, key=lambda c: float(np.hypot(
+                c[0][0] - self._loc_xy[0], c[0][1] - self._loc_xy[1])))
+        self._loc_xy = best[0]
+        self.sources.add("hsv")
+        return {"ok": True, "xy": best[0], "area": best[1]}
+
+    def _other_color_blobs(self, img, min_area):
+        """同帧里其它三种颜色的 (世界xy, 面积)，用于判颜色主导度。"""
+        out = []
+        for c in ("red", "green", "blue", "yellow"):
+            if c == self.color:
+                continue
+            for bl in (self._detect(img, c, min_area) or ()):
+                xy = self._project(bl["uv"])
+                if xy is not None:
+                    out.append((xy, float(bl["area"])))
+        return out
+
+    def _reject_bleed(self, blobs, img, min_area):
+        """按「颜色主导度」剔除色溢伪点。
+
+        === 为什么不是「重合即剔除」 ===
+        红/黄在 HSV 里互相色溢：红色检测器在**真黄块**上也报一块红
+        （本机实测 seed15：红 303+128、黄 300+231）。若「与另一颜色重合
+        就剔除」，两个候选都会被杀，回退后仍按最大面积选到伪点。
+        改用主导度：同一位置（<= bleed_gate），目标色面积必须显著大于
+        其它颜色在该处的面积（> 1.2 倍）才认为是真目标色。实测伪点（红块
+        上的黄高光）黄 300 vs 红 303 —— 黄不占优，剔除；真黄块黄 231 vs
+        红 128 —— 黄占优，保留（2026-11-22 本机 20 局）。
+        单候选或全被剔除时回退原集合，绝不让过滤把唯一目标杀掉。
+        """
+        blobs = list(blobs)
+        if img is None or len(blobs) < 2:
+            return blobs
+        others = self._other_color_blobs(img, min_area)
+        if not others:
+            return blobs
+        gate = float(self.cfg["bleed_gate"])
+        keep = []
+        for bl in blobs:
+            xy = self._project(bl["uv"])
+            if xy is None:
+                continue
+            a_self = float(bl["area"])
+            dominated = False
+            for (oxy, oarea) in others:
+                if float(np.hypot(xy[0] - oxy[0], xy[1] - oxy[1])) > gate:
+                    continue
+                if oarea * 1.2 >= a_self:      # 别色在该处不弱于目标色
+                    dominated = True
+                    break
+            if not dominated:
+                keep.append(bl)
+        return keep if keep else blobs
+
+    def _accept_blobs(self, blobs, img=None):
+        """SEARCH 整帧候选准入。
+
+        先剔除反投影越出台面的（边缘剪影 / 背景），再做色溢一致性剔除。
+        边缘剪影被裁掉一角、质心偏移、反投影落带外；不过滤会让 hold 每帧
+        续期把车「钉」在原地（2026-11-21 实测 seed 3）。
+        """
+        ok = []
+        for b in blobs or ():
+            try:
+                uv = b["uv"]
+            except (KeyError, TypeError):
+                continue
+            if self._project(uv) is not None:
+                ok.append(b)
+        ma = self._min_area
+        if ma is None and img is not None:
+            ma = scale_min_area(float(self.cfg["min_area_px"]),
+                                img.shape[1], img.shape[0])
+        return self._reject_bleed(ok, img, ma or 25.0)
+
+    def _project(self, uv):
+        """像素 → 方块中心高度平面的世界 xy，越出物体带返回 None。
+
+        投中心平面（不是顶面）：剪影质心的射线本来就该和过质心的水平面
+        求交。实测 0.7~1.6 m 中心平面 1~11 mm、顶面 4~63 mm —— 顶面在
+        远点会把红色偏出 GROUND_BOUNDS 下界（0.43），表现为「看得见却
+        定位被过滤」。见 color_grounding.ground_color 的实测表。
+        """
+        fn = getattr(self.backend, "camera_model", None)
+        if fn is None:
+            return None
+        cam = fn(self.camera)
+        if cam is None:
+            return None
+        plane_z = TABLE_TOP_Z + CUBE_HALF
+        pts, ok = cam.hit_plane(float(uv[0]), float(uv[1]), plane_z)
+        if not bool(np.asarray(ok)):
+            return None
+        x, y = float(pts[0]), float(pts[1])
+        (x0, x1), (y0, y1) = GROUND_BOUNDS
+        if not (x0 <= x <= x1 and y0 <= y <= y1):
+            return None
+        return (x, y)
+
+    # ---------- 位姿 ----------
+    def _get_yaw(self):
+        return self._get_pose()[2]
+
+    def _get_pose(self):
+        b = self.backend.get_base_state()
+        if b.get("pos") is None or b.get("yaw") is None:
+            raise RuntimeError("底盘位姿不可用（get_base_state 返回 None）")
+        return (float(b["pos"][0]), float(b["pos"][1]), float(b["yaw"]))
+
+    def _goal_err(self, goal):
+        bx, by, byaw = self._get_pose()
+        return (float(np.hypot(goal[0] - bx, goal[1] - by)),
+                abs(_wrap_pi(goal[2] - byaw)))
+
+    def _in_box(self, goal, tol_xy, tol_yaw):
+        if goal is None:
+            return False
+        exy, eyaw = self._goal_err(goal)
+        return exy <= float(tol_xy) and eyaw <= float(tol_yaw)
+
+    # ---------- 底盘 ----------
+    def _drive(self, vx, vy, wz):
+        self.backend.move_base(float(vx), float(vy), float(wz))
+
+    def _stop(self):
+        try:
+            self.backend.stop_base()
+        except Exception:
+            pass
+
+    def _sleep(self):
+        if self.cfg["realtime_sleep"]:
+            self._sleep_fn(float(self.cfg["frame_dt"]))
+
+    # ---------- 结果 ----------
+    def _mark(self, phase, reason):
+        self.phases.append((phase, reason))
+        self._log("%s ← %s" % (phase, reason))
+
+    def _fail(self, reason, sh=None):
+        self._log("FAILED ← %s" % reason)
+        return NavResult(False, NavPhase.FAILED, self.color, None, None,
+                         None, None, None,
+                         self.frames, reason=reason,
+                         phases=self.phases, sources=self.sources,
+                         truth_calls=self._truth_calls)
+
+    def _log(self, s):
+        if self.verbose:
+            print("[nav] " + s, flush=True)
